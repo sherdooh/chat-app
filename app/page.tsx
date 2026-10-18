@@ -6,18 +6,26 @@ import {
   ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import {
   ArrowDown,
   Check,
+  CheckCheck,
   Eye,
   EyeOff,
   LockKeyhole,
   LogOut,
+  MoreHorizontal,
+  Pencil,
+  Reply,
+  RotateCw,
   Send,
   Smile,
+  Trash2,
+  X,
 } from "lucide-react";
 import { getSupabase } from "@/lib/supabase";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
@@ -28,6 +36,18 @@ const APP = {
   name: "close",
   chatTitle: "hey babe 💕",
   creator: "Shaddie",
+};
+
+type Person = { name: string; emoji: string; photo: string | null };
+
+/**
+ * Two people, one app. Each of you sees yourself as "me".
+ * Drop a file in /public/avatars/ and set `photo` to e.g. "/avatars/you.jpg".
+ * Leave `photo: null` to use the emoji.
+ */
+const PEOPLE: { me: Person; them: Person } = {
+  me: { name: "You", emoji: "🌸", photo: null },
+  them: { name: "Shaddie", emoji: "🌿", photo: null },
 };
 
 const QUICK_EMOJI = [
@@ -45,6 +65,8 @@ const QUICK_EMOJI = [
   "😴",
 ];
 
+const REACTION_SET = ["❤️", "😂", "🥺", "🔥", "👍", "😮"];
+
 /* ---------- types & helpers ---------- */
 
 type ChatMessage = {
@@ -52,7 +74,24 @@ type ChatMessage = {
   sender_id: string;
   content: string;
   created_at: string;
+  edited_at?: string | null;
+  deleted_at?: string | null;
+  reply_to?: string | null;
 };
+
+/** A message that exists only on this device, until the insert resolves. */
+type Outgoing = ChatMessage & { status?: "sending" | "failed" };
+
+type Reaction = { message_id: string; user_id: string; emoji: string };
+
+type Receipt = {
+  user_id: string;
+  last_read_at: string | null;
+  last_delivered_at: string | null;
+};
+
+const MESSAGE_COLUMNS =
+  "id,sender_id,content,created_at,edited_at,deleted_at,reply_to";
 
 const timeFmt = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
@@ -75,9 +114,10 @@ function dayLabel(value: string) {
   }).format(date);
 }
 
+const timeOf = (value: string) => new Date(value).getTime();
+
 const byTime = (a: ChatMessage, b: ChatMessage) =>
-  new Date(a.created_at).getTime() - new Date(b.created_at).getTime() ||
-  a.id.localeCompare(b.id);
+  timeOf(a.created_at) - timeOf(b.created_at) || a.id.localeCompare(b.id);
 
 /** Merge lists by id (later lists win), oldest first. Never loses a message, never duplicates one. */
 function mergeMessages(...lists: ChatMessage[][]) {
@@ -112,6 +152,42 @@ function friendlyAuthError(message: string) {
   return message;
 }
 
+const newLocalId = () =>
+  `local-${
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2)
+  }`;
+
+/* ---------- small components ---------- */
+
+function Avatar({
+  person,
+  size = "md",
+  ring = false,
+}: {
+  person: Person;
+  size?: "xs" | "sm" | "md";
+  ring?: boolean;
+}) {
+  const cls = [
+    "avatar",
+    size !== "md" ? `avatar-${size}` : "",
+    ring ? "has-ring" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    <span className={cls} aria-hidden="true">
+      {person.photo ? (
+        <img src={person.photo} alt="" loading="lazy" />
+      ) : (
+        person.emoji
+      )}
+    </span>
+  );
+}
+
 /* ---------- the app ---------- */
 
 export default function Home() {
@@ -121,19 +197,26 @@ export default function Home() {
   const [access, setAccess] = useState<"checking" | "ok" | "denied">(
     "checking",
   );
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
+  const [messages, setMessages] = useState<Outgoing[]>([]);
+  const [reactions, setReactions] = useState<Reaction[]>([]);
+  const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [online, setOnline] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [notice, setNotice] = useState("");
+
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [actionsFor, setActionsFor] = useState<string | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -142,6 +225,11 @@ export default function Home() {
   const firstScroll = useRef(true);
   const coarsePointer = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const receiptPing = useRef<{ delivered: number; read: number }>({
+    delivered: 0,
+    read: 0,
+  });
+
   messagesRef.current = messages;
 
   const userId = user?.id ?? null;
@@ -153,42 +241,64 @@ export default function Home() {
       const saved = localStorage.getItem("close:email");
       if (saved) setEmail(saved);
     } catch {}
+
+    let alive = true;
+    let unsubscribe: (() => void) | undefined;
+
     try {
       const client = getSupabase();
       setSupabase(client);
-      client.auth.getSession().then(({ data, error }) => {
-        if (error) setAuthError(friendlyAuthError(error.message));
-        setUser(data.session?.user ?? null);
-        setBooting(false);
-      });
+
+      client.auth
+        .getSession()
+        .then(({ data, error }) => {
+          if (!alive) return;
+          if (error) setAuthError(friendlyAuthError(error.message));
+          setUser(data.session?.user ?? null);
+          setBooting(false);
+        })
+        .catch((error: unknown) => {
+          if (!alive) return;
+          setAuthError(
+            error instanceof Error ? error.message : "Could not start the app.",
+          );
+          setBooting(false);
+        });
+
       const { data: listener } = client.auth.onAuthStateChange(
-        (_event, session) => {
+        (event, session) => {
           setUser(session?.user ?? null);
           setBooting(false);
+          if (event === "SIGNED_IN") setAuthError("");
         },
       );
-      return () => listener.subscription.unsubscribe();
+      unsubscribe = () => listener.subscription.unsubscribe();
     } catch (error) {
       setAuthError(
         error instanceof Error ? error.message : "Could not start the app.",
       );
       setBooting(false);
     }
+
+    return () => {
+      alive = false;
+      unsubscribe?.();
+    };
   }, []);
 
   /* load history. With `since`, only fetches what's new (used after reconnecting) */
   const loadMessages = useCallback(
     async (client: SupabaseClient, since?: string) => {
       if (!since && messagesRef.current.length === 0) setLoadingMessages(true);
+
       const pageSize = 1000;
       const fetched: ChatMessage[] = [];
       let offset = 0;
       let loadError: { message: string } | null = null;
+
       // Fetch in pages so a long conversation is never cut off by the API row limit.
       for (;;) {
-        let query = client
-          .from("messages")
-          .select("id,sender_id,content,created_at");
+        let query = client.from("messages").select(MESSAGE_COLUMNS);
         if (since) query = query.gte("created_at", since);
         const { data, error } = await query
           .order("created_at", { ascending: true })
@@ -203,6 +313,7 @@ export default function Home() {
         if (page.length < pageSize) break;
         offset += pageSize;
       }
+
       if (loadError) {
         if (!since)
           setNotice(`Couldn't load your messages 😕 ${loadError.message}`);
@@ -216,14 +327,31 @@ export default function Home() {
     [],
   );
 
+  const loadReactions = useCallback(async (client: SupabaseClient) => {
+    const { data, error } = await client
+      .from("message_reactions")
+      .select("message_id,user_id,emoji");
+    if (!error && data) setReactions(data as Reaction[]);
+  }, []);
+
+  const loadReceipts = useCallback(async (client: SupabaseClient) => {
+    const { data, error } = await client
+      .from("message_reads")
+      .select("user_id,last_read_at,last_delivered_at");
+    if (!error && data) setReceipts(data as Receipt[]);
+  }, []);
+
   /* membership check, history, live updates */
   useEffect(() => {
     if (!supabase || !userId) {
       setMessages([]);
+      setReactions([]);
+      setReceipts([]);
       setOnline(false);
       setAccess("checking");
       return;
     }
+
     let alive = true;
     let channel: ReturnType<SupabaseClient["channel"]> | null = null;
 
@@ -234,6 +362,7 @@ export default function Home() {
         .eq("user_id", userId)
         .maybeSingle();
       if (!alive) return;
+
       // Only block when we're sure. A network hiccup shouldn't lock you out (the database
       // rules still protect the messages either way).
       if (!error && !member) {
@@ -241,7 +370,10 @@ export default function Home() {
         return;
       }
       setAccess("ok");
+
       void loadMessages(supabase);
+      void loadReactions(supabase);
+      void loadReceipts(supabase);
 
       channel = supabase
         .channel("private-two-person-chat")
@@ -251,7 +383,70 @@ export default function Home() {
           (payload) => {
             const incoming = payload.new as ChatMessage;
             if (!incoming?.id || !alive) return;
+            // Our own sends resolve through the insert response — ignore the echo so the
+            // optimistic bubble and the real row don't briefly both show.
+            if (incoming.sender_id === userId) return;
             setMessages((previous) => mergeMessages(previous, [incoming]));
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "messages" },
+          (payload) => {
+            const incoming = payload.new as ChatMessage;
+            if (!incoming?.id || !alive) return;
+            setMessages((previous) =>
+              previous.map((m) =>
+                m.id === incoming.id
+                  ? { ...m, ...incoming, status: undefined }
+                  : m,
+              ),
+            );
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "message_reactions" },
+          (payload) => {
+            if (!alive) return;
+            if (payload.eventType === "INSERT") {
+              const row = payload.new as Reaction;
+              if (!row?.message_id) return;
+              setReactions((previous) =>
+                previous.some(
+                  (r) =>
+                    r.message_id === row.message_id &&
+                    r.user_id === row.user_id &&
+                    r.emoji === row.emoji,
+                )
+                  ? previous
+                  : [...previous, row],
+              );
+            } else if (payload.eventType === "DELETE") {
+              const row = payload.old as Partial<Reaction>;
+              if (row?.message_id && row?.user_id && row?.emoji) {
+                setReactions((previous) =>
+                  previous.filter(
+                    (r) =>
+                      !(
+                        r.message_id === row.message_id &&
+                        r.user_id === row.user_id &&
+                        r.emoji === row.emoji
+                      ),
+                  ),
+                );
+              } else {
+                void loadReactions(supabase);
+              }
+            }
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "message_reads" },
+          () => {
+            if (!alive) return;
+            void loadReceipts(supabase);
           },
         )
         .subscribe((status) => {
@@ -259,7 +454,9 @@ export default function Home() {
           setOnline(status === "SUBSCRIBED");
           // (Re)connected: grab anything that arrived while we were away.
           if (status === "SUBSCRIBED") {
-            void loadMessages(supabase, messagesRef.current.at(-1)?.created_at);
+            void loadMessages(supabase, lastSyncedAt());
+            void loadReactions(supabase);
+            void loadReceipts(supabase);
           }
         });
     })();
@@ -268,19 +465,48 @@ export default function Home() {
       alive = false;
       if (channel) void supabase.removeChannel(channel);
     };
-  }, [supabase, userId, loadMessages]);
+  }, [supabase, userId, loadMessages, loadReactions, loadReceipts]);
 
   /* coming back to the tab (phones drop connections in the background) */
   useEffect(() => {
     if (!supabase || !userId) return;
     const onVisible = () => {
-      const last = messagesRef.current.at(-1)?.created_at;
-      if (document.visibilityState === "visible" && last)
-        void loadMessages(supabase, last);
+      if (document.visibilityState !== "visible") return;
+      const last = lastSyncedAt();
+      if (last) void loadMessages(supabase, last);
+      void loadReceipts(supabase);
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
-  }, [supabase, userId, loadMessages]);
+  }, [supabase, userId, loadMessages, loadReceipts]);
+
+  /* receipts: tell the other person we have it, and that we've read it */
+  const pingReceipt = useCallback(
+    async (kind: "delivered" | "read") => {
+      if (!supabase || !userId) return;
+      const now = Date.now();
+      if (now - receiptPing.current[kind] < 4000) return;
+      receiptPing.current[kind] = now;
+      const iso = new Date(now).toISOString();
+      const patch =
+        kind === "read"
+          ? { user_id: userId, last_read_at: iso, last_delivered_at: iso }
+          : { user_id: userId, last_delivered_at: iso };
+      const { error } = await supabase
+        .from("message_reads")
+        .upsert(patch, { onConflict: "user_id" });
+      // Silent: a missed receipt just means a tick stays grey. Never worth a banner.
+      if (error) receiptPing.current[kind] = 0;
+    },
+    [supabase, userId],
+  );
+
+  useEffect(() => {
+    if (!userId || messages.length === 0) return;
+    void pingReceipt("delivered");
+    if (stickToBottom.current && document.visibilityState === "visible")
+      void pingReceipt("read");
+  }, [messages, userId, pingReceipt]);
 
   /* scrolling */
   useEffect(() => {
@@ -312,7 +538,72 @@ export default function Home() {
     el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
   }, [draft, access]);
 
-  /* actions */
+  /* ---------- derived ---------- */
+
+  const messageById = useMemo(() => {
+    const map = new Map<string, Outgoing>();
+    for (const m of messages) map.set(m.id, m);
+    return map;
+  }, [messages]);
+
+  const reactionsByMessage = useMemo(() => {
+    const grouped = new Map<
+      string,
+      Map<string, { count: number; mine: boolean }>
+    >();
+    for (const r of reactions) {
+      let perEmoji = grouped.get(r.message_id);
+      if (!perEmoji) {
+        perEmoji = new Map();
+        grouped.set(r.message_id, perEmoji);
+      }
+      const entry = perEmoji.get(r.emoji) ?? { count: 0, mine: false };
+      entry.count += 1;
+      if (user && r.user_id === user.id) entry.mine = true;
+      perEmoji.set(r.emoji, entry);
+    }
+    const out = new Map<
+      string,
+      { emoji: string; count: number; mine: boolean }[]
+    >();
+    for (const [id, perEmoji] of grouped) {
+      out.set(
+        id,
+        [...perEmoji.entries()].map(([emoji, v]) => ({ emoji, ...v })),
+      );
+    }
+    return out;
+  }, [reactions, user]);
+
+  const otherReceipt = useMemo(
+    () => receipts.find((r) => r.user_id !== user?.id) ?? null,
+    [receipts, user],
+  );
+
+  function lastSyncedAt(): string | undefined {
+    const list = messagesRef.current;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (!(list[i] as Outgoing).status) return list[i].created_at;
+    }
+    return undefined;
+  }
+
+  function receiptStateFor(message: Outgoing) {
+    if (message.status === "sending") return "sending" as const;
+    if (message.status === "failed") return "failed" as const;
+    const at = timeOf(message.created_at);
+    if (otherReceipt?.last_read_at && timeOf(otherReceipt.last_read_at) >= at)
+      return "read" as const;
+    if (
+      otherReceipt?.last_delivered_at &&
+      timeOf(otherReceipt.last_delivered_at) >= at
+    )
+      return "delivered" as const;
+    return "sent" as const;
+  }
+
+  /* ---------- actions ---------- */
+
   async function signIn(event: FormEvent) {
     event.preventDefault();
     if (!supabase || signingIn) return;
@@ -336,35 +627,217 @@ export default function Home() {
   async function signOut() {
     if (supabase) await supabase.auth.signOut();
     setMessages([]);
+    setReactions([]);
+    setReceipts([]);
     setEmojiOpen(false);
+    setReplyingTo(null);
+    setEditingId(null);
+    setActionsFor(null);
     firstScroll.current = true;
     stickToBottom.current = true;
   }
 
-  async function sendMessage(event?: FormEvent) {
-    event?.preventDefault();
-    const content = draft.trim();
-    if (!supabase || !user || !content || sending) return;
-    setSending(true);
-    setDraft("");
-    setEmojiOpen(false);
-    stickToBottom.current = true;
+  /** Insert one optimistic message, then reconcile with the server. */
+  async function deliver(message: Outgoing) {
+    if (!supabase) return;
+    setMessages((previous) =>
+      previous.map((m) =>
+        m.id === message.id ? { ...m, status: "sending" } : m,
+      ),
+    );
+
     const { data, error } = await supabase
       .from("messages")
-      .insert({ sender_id: user.id, content })
-      .select("id,sender_id,content,created_at")
+      .insert({
+        sender_id: message.sender_id,
+        content: message.content,
+        reply_to: message.reply_to ?? null,
+      })
+      .select(MESSAGE_COLUMNS)
       .single();
-    if (error) {
-      setDraft(content);
-      setNotice(
-        `That didn't send 😕 It's back in the box, try again. (${error.message})`,
+
+    if (error || !data) {
+      setMessages((previous) =>
+        previous.map((m) =>
+          m.id === message.id ? { ...m, status: "failed" } : m,
+        ),
       );
-    } else if (data) {
-      setMessages((previous) => mergeMessages(previous, [data as ChatMessage]));
-      setNotice("");
+      setNotice("That didn't send 😕 Tap the message to try again.");
+      return;
     }
-    setSending(false);
+
+    setMessages((previous) =>
+      mergeMessages(
+        previous.filter((m) => m.id !== message.id),
+        [data as ChatMessage],
+      ),
+    );
+    setNotice("");
+  }
+
+  async function sendMessage() {
+    const content = draft.trim();
+    if (!supabase || !user || !content) return;
+
+    const optimistic: Outgoing = {
+      id: newLocalId(),
+      sender_id: user.id,
+      content,
+      created_at: new Date().toISOString(),
+      reply_to:
+        replyingTo && !replyingTo.id.startsWith("local-")
+          ? replyingTo.id
+          : null,
+      status: "sending",
+    };
+
+    setMessages((previous) => [...previous, optimistic]);
+    setDraft("");
+    setReplyingTo(null);
+    setEmojiOpen(false);
+    stickToBottom.current = true;
+    void pingReceipt("read");
+
+    await deliver(optimistic);
     composerRef.current?.focus();
+  }
+
+  async function saveEdit() {
+    if (!supabase || !editingId) return;
+    const content = draft.trim();
+    if (!content) return;
+
+    const id = editingId;
+    const original = messages.find((m) => m.id === id);
+    setEditingId(null);
+    setDraft("");
+    if (!original || original.content === content) return;
+
+    const editedAt = new Date().toISOString();
+    setMessages((previous) =>
+      previous.map((m) =>
+        m.id === id ? { ...m, content, edited_at: editedAt } : m,
+      ),
+    );
+
+    const { error } = await supabase
+      .from("messages")
+      .update({ content, edited_at: editedAt })
+      .eq("id", id);
+
+    if (error) {
+      setMessages((previous) =>
+        previous.map((m) =>
+          m.id === id
+            ? { ...m, content: original.content, edited_at: original.edited_at }
+            : m,
+        ),
+      );
+      setNotice(`Couldn't save that edit 😕 ${error.message}`);
+    }
+    composerRef.current?.focus();
+  }
+
+  async function deleteMessage(id: string) {
+    if (!supabase) return;
+    setActionsFor(null);
+    const original = messages.find((m) => m.id === id);
+    if (!original || original.deleted_at) return;
+
+    const deletedAt = new Date().toISOString();
+    setMessages((previous) =>
+      previous.map((m) =>
+        m.id === id ? { ...m, content: "", deleted_at: deletedAt } : m,
+      ),
+    );
+
+    const { error } = await supabase
+      .from("messages")
+      .update({ content: "", deleted_at: deletedAt })
+      .eq("id", id);
+
+    if (error) {
+      setMessages((previous) =>
+        previous.map((m) => (m.id === id ? original : m)),
+      );
+      setNotice(`Couldn't delete that 😕 ${error.message}`);
+    }
+  }
+
+  async function toggleReaction(messageId: string, emoji: string) {
+    if (!supabase || !user) return;
+    setActionsFor(null);
+
+    const mine = reactions.find(
+      (r) =>
+        r.message_id === messageId &&
+        r.user_id === user.id &&
+        r.emoji === emoji,
+    );
+
+    if (mine) {
+      setReactions((previous) =>
+        previous.filter(
+          (r) =>
+            !(
+              r.message_id === messageId &&
+              r.user_id === user.id &&
+              r.emoji === emoji
+            ),
+        ),
+      );
+      const { error } = await supabase
+        .from("message_reactions")
+        .delete()
+        .match({ message_id: messageId, user_id: user.id, emoji });
+      if (error) {
+        setReactions((previous) => [...previous, mine]);
+        setNotice(`Couldn't remove that reaction 😕 ${error.message}`);
+      }
+    } else {
+      const optimistic: Reaction = {
+        message_id: messageId,
+        user_id: user.id,
+        emoji,
+      };
+      setReactions((previous) => [...previous, optimistic]);
+      const { error } = await supabase
+        .from("message_reactions")
+        .insert(optimistic);
+      if (error) {
+        setReactions((previous) =>
+          previous.filter(
+            (r) =>
+              !(
+                r.message_id === messageId &&
+                r.user_id === user.id &&
+                r.emoji === emoji
+              ),
+          ),
+        );
+        setNotice(`Couldn't add that reaction 😕 ${error.message}`);
+      }
+    }
+  }
+
+  function startEditing(message: Outgoing) {
+    setActionsFor(null);
+    setReplyingTo(null);
+    setEditingId(message.id);
+    setDraft(message.content);
+    requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(
+        message.content.length,
+        message.content.length,
+      );
+    });
+  }
+
+  function cancelComposerExtras() {
+    setReplyingTo(null);
+    setEditingId(null);
+    setDraft("");
   }
 
   function addEmoji(emoji: string) {
@@ -385,6 +858,14 @@ export default function Home() {
     const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
     stickToBottom.current = atBottom;
     setShowScrollButton(!atBottom && messages.length > 0);
+    if (atBottom && document.visibilityState === "visible")
+      void pingReceipt("read");
+  }
+
+  function onComposerSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (editingId) void saveEdit();
+    else void sendMessage();
   }
 
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -396,7 +877,12 @@ export default function Home() {
       !coarsePointer.current
     ) {
       event.preventDefault();
-      void sendMessage();
+      if (editingId) void saveEdit();
+      else void sendMessage();
+    }
+    if (event.key === "Escape" && (editingId || replyingTo)) {
+      event.preventDefault();
+      cancelComposerExtras();
     }
   }
 
@@ -516,8 +1002,8 @@ export default function Home() {
             <h1>Not on the list 🙅</h1>
             <p>
               {APP.name} is just for two people, and{" "}
-              <strong>{user.email}</strong> isn&apos;t one of them yet. Wrong
-              account? Sign out and try the other one.
+              <strong>{user.email ?? "this account"}</strong> isn&apos;t one of
+              them yet. Wrong account? Sign out and try the other one.
             </p>
           </div>
           <button className="primary-button" type="button" onClick={signOut}>
@@ -546,9 +1032,7 @@ export default function Home() {
       <section className="chat-panel">
         <header className="chat-header">
           <div className="chat-person">
-            <div className="avatar" aria-hidden="true">
-              🥰
-            </div>
+            <Avatar person={PEOPLE.them} ring />
             <div className="person-copy">
               <h1>{APP.chatTitle}</h1>
               <div className="presence" role="status">
@@ -594,8 +1078,9 @@ export default function Home() {
 
             {!loadingMessages && messages.length === 0 && (
               <div className="empty-state">
-                <div className="empty-art" aria-hidden="true">
-                  💬
+                <div className="empty-avatars">
+                  <Avatar person={PEOPLE.them} />
+                  <Avatar person={PEOPLE.me} />
                 </div>
                 <h2>Say hi first 👋</h2>
                 <p>
@@ -615,12 +1100,19 @@ export default function Home() {
               const closeTogether = (a: ChatMessage, b: ChatMessage) =>
                 a.sender_id === b.sender_id &&
                 sameDay(a, b) &&
-                new Date(b.created_at).getTime() -
-                  new Date(a.created_at).getTime() <
-                  5 * 60 * 1000;
+                timeOf(b.created_at) - timeOf(a.created_at) < 5 * 60 * 1000;
+
               const showDate = !previous || !sameDay(previous, message);
               const joinedPrev = !!previous && closeTogether(previous, message);
               const endsGroup = !next || !closeTogether(message, next);
+
+              const deleted = !!message.deleted_at;
+              const parent = message.reply_to
+                ? messageById.get(message.reply_to)
+                : undefined;
+              const chips = reactionsByMessage.get(message.id) ?? [];
+              const receipt = mine ? receiptStateFor(message) : null;
+              const failed = message.status === "failed";
 
               return (
                 <div key={message.id}>
@@ -630,28 +1122,198 @@ export default function Home() {
                     </div>
                   )}
                   <div
-                    className={`message-row ${mine ? "mine" : "theirs"} ${joinedPrev ? "joined" : ""}`}
+                    className={`message-row ${mine ? "mine" : "theirs"} ${
+                      joinedPrev ? "joined" : ""
+                    }`}
                   >
                     {!mine &&
                       (endsGroup ? (
-                        <div className="tiny-avatar" aria-hidden="true">
-                          💚
-                        </div>
+                        <Avatar person={PEOPLE.them} size="xs" />
                       ) : (
                         <div className="avatar-spacer" />
                       ))}
-                    <div
-                      className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"} ${endsGroup ? "ends-group" : ""}`}
-                    >
-                      <span className="text">{linkify(message.content)}</span>
-                      <span className="meta">
-                        <time dateTime={message.created_at}>
-                          {timeLabel(message.created_at)}
-                        </time>
-                        {mine && (
-                          <Check size={14} className="tick" aria-label="Sent" />
+
+                    <div className="bubble-wrap">
+                      <div
+                        className={`bubble ${
+                          mine ? "bubble-mine" : "bubble-theirs"
+                        } ${endsGroup ? "ends-group" : ""} ${
+                          deleted ? "is-deleted" : ""
+                        }`}
+                      >
+                        {parent && !deleted && (
+                          <div className="reply-quote">
+                            <strong>
+                              {parent.sender_id === user.id
+                                ? "You"
+                                : PEOPLE.them.name}
+                            </strong>
+                            <span>
+                              {parent.deleted_at
+                                ? "message deleted"
+                                : parent.content}
+                            </span>
+                          </div>
                         )}
-                      </span>
+
+                        <span className="text">
+                          {deleted
+                            ? "This message was deleted"
+                            : linkify(message.content)}
+                        </span>
+
+                        {!deleted && message.edited_at && (
+                          <span className="edited-tag"> · edited</span>
+                        )}
+
+                        <span className="meta">
+                          <time dateTime={message.created_at}>
+                            {timeLabel(message.created_at)}
+                          </time>
+                          {mine && receipt === "sending" && (
+                            <span
+                              className="mini-spinner"
+                              aria-label="Sending"
+                            />
+                          )}
+                          {mine && receipt === "failed" && (
+                            <RotateCw
+                              size={13}
+                              className="tick is-failed"
+                              aria-label="Not sent"
+                            />
+                          )}
+                          {mine && receipt === "sent" && (
+                            <Check
+                              size={14}
+                              className="tick"
+                              aria-label="Sent"
+                            />
+                          )}
+                          {mine && receipt === "delivered" && (
+                            <CheckCheck
+                              size={14}
+                              className="tick"
+                              aria-label="Delivered"
+                            />
+                          )}
+                          {mine && receipt === "read" && (
+                            <CheckCheck
+                              size={14}
+                              className="tick is-read"
+                              aria-label="Read"
+                            />
+                          )}
+                        </span>
+                      </div>
+
+                      {failed && (
+                        <button
+                          type="button"
+                          className="retry-chip"
+                          onClick={() => void deliver(message)}
+                        >
+                          <RotateCw size={12} /> Try again
+                        </button>
+                      )}
+
+                      <div className="bubble-foot">
+                        {chips.length > 0 && (
+                          <div className="reaction-chips">
+                            {chips.map((chip) => (
+                              <button
+                                key={chip.emoji}
+                                type="button"
+                                className={`reaction-chip ${
+                                  chip.mine ? "is-mine" : ""
+                                }`}
+                                onClick={() =>
+                                  void toggleReaction(message.id, chip.emoji)
+                                }
+                                aria-label={`${chip.emoji} ${chip.count}`}
+                              >
+                                {chip.emoji}
+                                {chip.count > 1 && <b>{chip.count}</b>}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        {!deleted && !message.status && (
+                          <button
+                            type="button"
+                            className="more-button"
+                            aria-label="Message actions"
+                            aria-expanded={actionsFor === message.id}
+                            onClick={() =>
+                              setActionsFor(
+                                actionsFor === message.id ? null : message.id,
+                              )
+                            }
+                          >
+                            <MoreHorizontal size={16} />
+                          </button>
+                        )}
+
+                        {actionsFor === message.id && (
+                          <>
+                            <button
+                              type="button"
+                              className="pop-backdrop"
+                              aria-label="Close"
+                              onClick={() => setActionsFor(null)}
+                            />
+                            <div className="action-pop" role="menu">
+                              <div className="reaction-row">
+                                {REACTION_SET.map((emoji) => (
+                                  <button
+                                    key={emoji}
+                                    type="button"
+                                    onClick={() =>
+                                      void toggleReaction(message.id, emoji)
+                                    }
+                                    aria-label={`React with ${emoji}`}
+                                  >
+                                    {emoji}
+                                  </button>
+                                ))}
+                              </div>
+                              <div className="action-list">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setActionsFor(null);
+                                    setEditingId(null);
+                                    setReplyingTo(message);
+                                    composerRef.current?.focus();
+                                  }}
+                                >
+                                  <Reply size={15} /> Reply
+                                </button>
+                                {mine && (
+                                  <button
+                                    type="button"
+                                    onClick={() => startEditing(message)}
+                                  >
+                                    <Pencil size={15} /> Edit
+                                  </button>
+                                )}
+                                {mine && (
+                                  <button
+                                    type="button"
+                                    className="danger"
+                                    onClick={() =>
+                                      void deleteMessage(message.id)
+                                    }
+                                  >
+                                    <Trash2 size={15} /> Delete
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -684,6 +1346,39 @@ export default function Home() {
         )}
 
         <footer className="composer-area">
+          {(replyingTo || editingId) && (
+            <div className="composer-banner">
+              <div className="banner-icon" aria-hidden="true">
+                {editingId ? <Pencil size={15} /> : <Reply size={15} />}
+              </div>
+              <div className="banner-copy">
+                <strong>
+                  {editingId
+                    ? "Editing message"
+                    : `Replying to ${
+                        replyingTo && replyingTo.sender_id === user.id
+                          ? "yourself"
+                          : PEOPLE.them.name
+                      }`}
+                </strong>
+                <span>
+                  {editingId
+                    ? (messages.find((m) => m.id === editingId)?.content ?? "")
+                    : replyingTo?.deleted_at
+                      ? "message deleted"
+                      : (replyingTo?.content ?? "")}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={cancelComposerExtras}
+                aria-label="Cancel"
+              >
+                <X size={16} />
+              </button>
+            </div>
+          )}
+
           {emojiOpen && (
             <div className="emoji-tray" role="group" aria-label="Quick emoji">
               {QUICK_EMOJI.map((emoji) => (
@@ -699,7 +1394,8 @@ export default function Home() {
               ))}
             </div>
           )}
-          <form className="composer" onSubmit={sendMessage}>
+
+          <form className="composer" onSubmit={onComposerSubmit}>
             <button
               type="button"
               className={`emoji-toggle ${emojiOpen ? "is-open" : ""}`}
@@ -712,9 +1408,11 @@ export default function Home() {
             </button>
             <textarea
               ref={composerRef}
-              aria-label="Write a message"
+              aria-label={editingId ? "Edit your message" : "Write a message"}
               rows={1}
-              placeholder="Say something… 💬"
+              placeholder={
+                editingId ? "Edit your message…" : "Say something… 💬"
+              }
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={onComposerKeyDown}
@@ -723,15 +1421,11 @@ export default function Home() {
             <button
               className="send-button"
               type="submit"
-              disabled={!draft.trim() || sending}
-              aria-label="Send message"
+              disabled={!draft.trim()}
+              aria-label={editingId ? "Save edit" : "Send message"}
               onPointerDown={(e) => e.preventDefault()}
             >
-              {sending ? (
-                <span className="mini-spinner light" />
-              ) : (
-                <Send size={19} />
-              )}
+              {editingId ? <Check size={19} /> : <Send size={19} />}
             </button>
           </form>
           <div className="composer-hint">
