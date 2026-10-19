@@ -30,7 +30,7 @@ import {
 import { getSupabase } from "@/lib/supabase";
 import type { SupabaseClient, User } from "@supabase/supabase-js";
 
-/* ---------- the bits you'll probably want to tweak ---------- */
+/* ---------- config ---------- */
 
 const APP = {
   name: "close",
@@ -40,14 +40,9 @@ const APP = {
 
 type Person = { name: string; emoji: string; photo: string | null };
 
-/**
- * Two people, one app. Each of you sees yourself as "me".
- * Drop a file in /public/avatars/ and set `photo` to e.g. "/avatars/you.jpg".
- * Leave `photo: null` to use the emoji.
- */
 const PEOPLE: { me: Person; them: Person } = {
   me: { name: "You", emoji: "🌸", photo: null },
-  them: { name: "Shaddie", emoji: "🌿", photo: null },
+  them: { name: "Shaddie", emoji: "💚", photo: null },
 };
 
 const QUICK_EMOJI = [
@@ -67,7 +62,7 @@ const QUICK_EMOJI = [
 
 const REACTION_SET = ["❤️", "😂", "🥺", "🔥", "👍", "😮"];
 
-/* ---------- types & helpers ---------- */
+/* ---------- types ---------- */
 
 type ChatMessage = {
   id: string;
@@ -79,25 +74,30 @@ type ChatMessage = {
   reply_to?: string | null;
 };
 
-/** A message that exists only on this device, until the insert resolves. */
 type Outgoing = ChatMessage & { status?: "sending" | "failed" };
-
 type Reaction = { message_id: string; user_id: string; emoji: string };
-
 type Receipt = {
   user_id: string;
   last_read_at: string | null;
   last_delivered_at: string | null;
 };
+type ReceiptPatch = {
+  user_id: string;
+  last_delivered_at: string;
+  last_read_at?: string;
+};
 
 const MESSAGE_COLUMNS =
   "id,sender_id,content,created_at,edited_at,deleted_at,reply_to";
+
+/* ---------- helpers ---------- */
 
 const timeFmt = new Intl.DateTimeFormat(undefined, {
   hour: "numeric",
   minute: "2-digit",
 });
-const timeLabel = (value: string) => timeFmt.format(new Date(value));
+const timeLabel = (v: string) => timeFmt.format(new Date(v));
+const timeOf = (v: string) => new Date(v).getTime();
 
 function dayLabel(value: string) {
   const date = new Date(value);
@@ -114,16 +114,20 @@ function dayLabel(value: string) {
   }).format(date);
 }
 
-const timeOf = (value: string) => new Date(value).getTime();
-
 const byTime = (a: ChatMessage, b: ChatMessage) =>
   timeOf(a.created_at) - timeOf(b.created_at) || a.id.localeCompare(b.id);
 
-/** Merge lists by id (later lists win), oldest first. Never loses a message, never duplicates one. */
 function mergeMessages(...lists: ChatMessage[][]) {
   const map = new Map<string, ChatMessage>();
   for (const list of lists) for (const m of list) map.set(m.id, m);
   return [...map.values()].sort(byTime);
+}
+
+function lastSyncedAt(list: ChatMessage[]): string | undefined {
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (!(list[i] as Outgoing).status) return list[i].created_at;
+  }
+  return undefined;
 }
 
 const URL_RE = /(https?:\/\/[^\s<]+[^\s<.,;:!?)"'\]])/g;
@@ -136,6 +140,17 @@ function linkify(text: string): ReactNode[] {
     ) : (
       part
     ),
+  );
+}
+
+/** Detect a bubble whose only content is 1–3 emoji. */
+function isEmojiOnly(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 20) return false;
+  const emojis = trimmed.match(/\p{Extended_Pictographic}/gu);
+  if (!emojis || emojis.length === 0 || emojis.length > 3) return false;
+  return /^(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Emoji_Component}|\u200D|\uFE0F|\s)+$/u.test(
+    trimmed,
   );
 }
 
@@ -188,7 +203,7 @@ function Avatar({
   );
 }
 
-/* ---------- the app ---------- */
+/* ---------- app ---------- */
 
 export default function Home() {
   const [supabase, setSupabase] = useState<SupabaseClient | null>(null);
@@ -229,12 +244,16 @@ export default function Home() {
     delivered: 0,
     read: 0,
   });
+  const lastPingedId = useRef<{
+    delivered: string | null;
+    read: string | null;
+  }>({ delivered: null, read: null });
 
   messagesRef.current = messages;
 
   const userId = user?.id ?? null;
 
-  /* sign-in session */
+  /* ---------- session ---------- */
   useEffect(() => {
     coarsePointer.current = window.matchMedia("(pointer: coarse)").matches;
     try {
@@ -257,10 +276,10 @@ export default function Home() {
           setUser(data.session?.user ?? null);
           setBooting(false);
         })
-        .catch((error: unknown) => {
+        .catch((err: unknown) => {
           if (!alive) return;
           setAuthError(
-            error instanceof Error ? error.message : "Could not start the app.",
+            err instanceof Error ? err.message : "Could not start the app.",
           );
           setBooting(false);
         });
@@ -273,9 +292,9 @@ export default function Home() {
         },
       );
       unsubscribe = () => listener.subscription.unsubscribe();
-    } catch (error) {
+    } catch (err) {
       setAuthError(
-        error instanceof Error ? error.message : "Could not start the app.",
+        err instanceof Error ? err.message : "Could not start the app.",
       );
       setBooting(false);
     }
@@ -286,17 +305,15 @@ export default function Home() {
     };
   }, []);
 
-  /* load history. With `since`, only fetches what's new (used after reconnecting) */
+  /* ---------- history ---------- */
   const loadMessages = useCallback(
     async (client: SupabaseClient, since?: string) => {
       if (!since && messagesRef.current.length === 0) setLoadingMessages(true);
-
       const pageSize = 1000;
       const fetched: ChatMessage[] = [];
       let offset = 0;
       let loadError: { message: string } | null = null;
 
-      // Fetch in pages so a long conversation is never cut off by the API row limit.
       for (;;) {
         let query = client.from("messages").select(MESSAGE_COLUMNS);
         if (since) query = query.gte("created_at", since);
@@ -318,7 +335,6 @@ export default function Home() {
         if (!since)
           setNotice(`Couldn't load your messages 😕 ${loadError.message}`);
       } else {
-        // Merge instead of replace, so a live message that arrives mid-fetch isn't lost.
         setMessages((previous) => mergeMessages(fetched, previous));
         setNotice("");
       }
@@ -341,7 +357,7 @@ export default function Home() {
     if (!error && data) setReceipts(data as Receipt[]);
   }, []);
 
-  /* membership check, history, live updates */
+  /* ---------- membership + realtime ---------- */
   useEffect(() => {
     if (!supabase || !userId) {
       setMessages([]);
@@ -363,8 +379,6 @@ export default function Home() {
         .maybeSingle();
       if (!alive) return;
 
-      // Only block when we're sure. A network hiccup shouldn't lock you out (the database
-      // rules still protect the messages either way).
       if (!error && !member) {
         setAccess("denied");
         return;
@@ -383,8 +397,6 @@ export default function Home() {
           (payload) => {
             const incoming = payload.new as ChatMessage;
             if (!incoming?.id || !alive) return;
-            // Our own sends resolve through the insert response — ignore the echo so the
-            // optimistic bubble and the real row don't briefly both show.
             if (incoming.sender_id === userId) return;
             setMessages((previous) => mergeMessages(previous, [incoming]));
           },
@@ -452,9 +464,8 @@ export default function Home() {
         .subscribe((status) => {
           if (!alive) return;
           setOnline(status === "SUBSCRIBED");
-          // (Re)connected: grab anything that arrived while we were away.
           if (status === "SUBSCRIBED") {
-            void loadMessages(supabase, lastSyncedAt());
+            void loadMessages(supabase, lastSyncedAt(messagesRef.current));
             void loadReactions(supabase);
             void loadReceipts(supabase);
           }
@@ -467,12 +478,12 @@ export default function Home() {
     };
   }, [supabase, userId, loadMessages, loadReactions, loadReceipts]);
 
-  /* coming back to the tab (phones drop connections in the background) */
+  /* ---------- tab visible again ---------- */
   useEffect(() => {
     if (!supabase || !userId) return;
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
-      const last = lastSyncedAt();
+      const last = lastSyncedAt(messagesRef.current);
       if (last) void loadMessages(supabase, last);
       void loadReceipts(supabase);
     };
@@ -480,22 +491,30 @@ export default function Home() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [supabase, userId, loadMessages, loadReceipts]);
 
-  /* receipts: tell the other person we have it, and that we've read it */
+  /* ---------- receipts ---------- */
   const pingReceipt = useCallback(
     async (kind: "delivered" | "read") => {
       if (!supabase || !userId) return;
+
+      const latest = messagesRef.current[messagesRef.current.length - 1];
+      const latestId = latest?.id ?? null;
       const now = Date.now();
-      if (now - receiptPing.current[kind] < 4000) return;
+      const sameAsLast = lastPingedId.current[kind] === latestId;
+
+      if (sameAsLast && now - receiptPing.current[kind] < 4000) return;
+
       receiptPing.current[kind] = now;
+      lastPingedId.current[kind] = latestId;
+
       const iso = new Date(now).toISOString();
-      const patch =
+      const patch: ReceiptPatch =
         kind === "read"
           ? { user_id: userId, last_read_at: iso, last_delivered_at: iso }
           : { user_id: userId, last_delivered_at: iso };
+
       const { error } = await supabase
         .from("message_reads")
         .upsert(patch, { onConflict: "user_id" });
-      // Silent: a missed receipt just means a tick stays grey. Never worth a banner.
       if (error) receiptPing.current[kind] = 0;
     },
     [supabase, userId],
@@ -508,7 +527,7 @@ export default function Home() {
       void pingReceipt("read");
   }, [messages, userId, pingReceipt]);
 
-  /* scrolling */
+  /* ---------- scrolling ---------- */
   useEffect(() => {
     if (!stickToBottom.current) return;
     bottomRef.current?.scrollIntoView({
@@ -518,7 +537,6 @@ export default function Home() {
     if (messages.length) firstScroll.current = false;
   }, [messages]);
 
-  // keep the latest message in view when the box grows, the emoji tray opens, or the keyboard shows
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
@@ -530,7 +548,6 @@ export default function Home() {
     return () => ro.disconnect();
   }, [access, userId]);
 
-  // message box grows with what you type
   useEffect(() => {
     const el = composerRef.current;
     if (!el) return;
@@ -539,7 +556,6 @@ export default function Home() {
   }, [draft, access]);
 
   /* ---------- derived ---------- */
-
   const messageById = useMemo(() => {
     const map = new Map<string, Outgoing>();
     for (const m of messages) map.set(m.id, m);
@@ -580,14 +596,6 @@ export default function Home() {
     [receipts, user],
   );
 
-  function lastSyncedAt(): string | undefined {
-    const list = messagesRef.current;
-    for (let i = list.length - 1; i >= 0; i--) {
-      if (!(list[i] as Outgoing).status) return list[i].created_at;
-    }
-    return undefined;
-  }
-
   function receiptStateFor(message: Outgoing) {
     if (message.status === "sending") return "sending" as const;
     if (message.status === "failed") return "failed" as const;
@@ -603,7 +611,6 @@ export default function Home() {
   }
 
   /* ---------- actions ---------- */
-
   async function signIn(event: FormEvent) {
     event.preventDefault();
     if (!supabase || signingIn) return;
@@ -635,9 +642,9 @@ export default function Home() {
     setActionsFor(null);
     firstScroll.current = true;
     stickToBottom.current = true;
+    lastPingedId.current = { delivered: null, read: null };
   }
 
-  /** Insert one optimistic message, then reconcile with the server. */
   async function deliver(message: Outgoing) {
     if (!supabase) return;
     setMessages((previous) =>
@@ -729,7 +736,11 @@ export default function Home() {
       setMessages((previous) =>
         previous.map((m) =>
           m.id === id
-            ? { ...m, content: original.content, edited_at: original.edited_at }
+            ? {
+                ...m,
+                content: original.content,
+                edited_at: original.edited_at,
+              }
             : m,
         ),
       );
@@ -746,14 +757,12 @@ export default function Home() {
 
     const deletedAt = new Date().toISOString();
     setMessages((previous) =>
-      previous.map((m) =>
-        m.id === id ? { ...m, content: "", deleted_at: deletedAt } : m,
-      ),
+      previous.map((m) => (m.id === id ? { ...m, deleted_at: deletedAt } : m)),
     );
 
     const { error } = await supabase
       .from("messages")
-      .update({ content: "", deleted_at: deletedAt })
+      .update({ deleted_at: deletedAt })
       .eq("id", id);
 
     if (error) {
@@ -869,7 +878,6 @@ export default function Home() {
   }
 
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    // On phones Enter adds a new line (the send button sends); on desktop Enter sends.
     if (
       event.key === "Enter" &&
       !event.shiftKey &&
@@ -887,7 +895,6 @@ export default function Home() {
   }
 
   /* ---------- screens ---------- */
-
   if (booting || (user && access === "checking"))
     return (
       <main className="splash">
@@ -1037,15 +1044,11 @@ export default function Home() {
               <h1>{APP.chatTitle}</h1>
               <div className="presence" role="status">
                 <span className={`presence-dot ${online ? "is-online" : ""}`} />
-                {online ? "connected ✨" : "reconnecting…"}
+                {online ? "online" : "connecting…"}
               </div>
             </div>
           </div>
           <div className="header-actions">
-            <div className="secure-label">
-              <LockKeyhole size={14} />
-              <span>just us</span>
-            </div>
             <button
               className="icon-button header-signout"
               title="Sign out"
@@ -1113,6 +1116,12 @@ export default function Home() {
               const chips = reactionsByMessage.get(message.id) ?? [];
               const receipt = mine ? receiptStateFor(message) : null;
               const failed = message.status === "failed";
+              const emojiOnly =
+                !deleted &&
+                !parent &&
+                !message.edited_at &&
+                isEmojiOnly(message.content);
+              const openBelow = index < 3;
 
               return (
                 <div key={message.id}>
@@ -1127,10 +1136,10 @@ export default function Home() {
                     }`}
                   >
                     {!mine &&
-                      (endsGroup ? (
-                        <Avatar person={PEOPLE.them} size="xs" />
-                      ) : (
+                      (joinedPrev ? (
                         <div className="avatar-spacer" />
+                      ) : (
+                        <Avatar person={PEOPLE.them} size="xs" />
                       ))}
 
                     <div className="bubble-wrap">
@@ -1139,7 +1148,7 @@ export default function Home() {
                           mine ? "bubble-mine" : "bubble-theirs"
                         } ${endsGroup ? "ends-group" : ""} ${
                           deleted ? "is-deleted" : ""
-                        }`}
+                        } ${emojiOnly ? "bubble-emoji-only" : ""}`}
                       >
                         {parent && !deleted && (
                           <div className="reply-quote">
@@ -1263,7 +1272,12 @@ export default function Home() {
                               aria-label="Close"
                               onClick={() => setActionsFor(null)}
                             />
-                            <div className="action-pop" role="menu">
+                            <div
+                              className={`action-pop ${
+                                openBelow ? "open-below" : ""
+                              }`}
+                              role="menu"
+                            >
                               <div className="reaction-row">
                                 {REACTION_SET.map((emoji) => (
                                   <button
@@ -1429,9 +1443,6 @@ export default function Home() {
             </button>
           </form>
           <div className="composer-hint">
-            <span>
-              <span className="hint-dot" /> Saved automatically 💾
-            </span>
             <span className="hint-keys">
               Enter to send · Shift + Enter for a new line
             </span>
