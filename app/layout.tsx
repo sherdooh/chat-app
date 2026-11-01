@@ -18,7 +18,7 @@ export const metadata: Metadata = {
   title: "close 💌 just us",
   description: "Our little corner of the internet. Just the two of us.",
   applicationName: "close",
-  robots: { index: false, follow: false }, // it's private, keep it out of search engines
+  robots: { index: false, follow: false },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
@@ -30,8 +30,8 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  interactiveWidget: "resizes-content", // keeps the message box above the mobile keyboard
-  themeColor: "#fff6ec",
+  interactiveWidget: "resizes-content",
+  themeColor: "#fbf3e8", // was "#fff6ec" — matches --bg
 };
 
 export default function RootLayout({

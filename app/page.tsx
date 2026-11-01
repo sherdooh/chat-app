@@ -80,6 +80,7 @@ type Receipt = {
   user_id: string;
   last_read_at: string | null;
   last_delivered_at: string | null;
+  last_seen_at: string | null; // NEW
 };
 type ReceiptPatch = {
   user_id: string;
@@ -98,6 +99,22 @@ const timeFmt = new Intl.DateTimeFormat(undefined, {
 });
 const timeLabel = (v: string) => timeFmt.format(new Date(v));
 const timeOf = (v: string) => new Date(v).getTime();
+
+function formatLastSeen(iso: string | null, now: number): string {
+  if (!iso) return "offline";
+  const diff = now - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `last seen ${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `last seen ${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `last seen ${days}d ago`;
+  return `last seen ${new Date(iso).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  })}`;
+}
 
 function dayLabel(value: string) {
   const date = new Date(value);
@@ -143,7 +160,6 @@ function linkify(text: string): ReactNode[] {
   );
 }
 
-/** Detect a bubble whose only content is 1–3 emoji. */
 function isEmojiOnly(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed || trimmed.length > 20) return false;
@@ -203,6 +219,42 @@ function Avatar({
   );
 }
 
+/** Presence pill — its own 30s tick so the message list never re-renders for it. */
+function PresenceLabel({
+  connected,
+  lastSeenAt,
+}: {
+  connected: boolean;
+  lastSeenAt: string | null;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!connected) {
+    return (
+      <div className="presence" role="status">
+        <span className="presence-dot" />
+        reconnecting…
+      </div>
+    );
+  }
+
+  const isOnline =
+    !!lastSeenAt && now - new Date(lastSeenAt).getTime() < 60_000;
+
+  return (
+    <div className="presence" role="status">
+      <span
+        className={`presence-dot ${isOnline ? "is-online" : "is-offline"}`}
+      />
+      {isOnline ? "online" : formatLastSeen(lastSeenAt, now)}
+    </div>
+  );
+}
+
 /* ---------- app ---------- */
 
 export default function Home() {
@@ -233,6 +285,8 @@ export default function Home() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [actionsFor, setActionsFor] = useState<string | null>(null);
 
+  const [pageHidden, setPageHidden] = useState(false);
+
   const listRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -248,6 +302,7 @@ export default function Home() {
     delivered: string | null;
     read: string | null;
   }>({ delivered: null, read: null });
+  const askedNotifPerm = useRef(false);
 
   messagesRef.current = messages;
 
@@ -353,7 +408,7 @@ export default function Home() {
   const loadReceipts = useCallback(async (client: SupabaseClient) => {
     const { data, error } = await client
       .from("message_reads")
-      .select("user_id,last_read_at,last_delivered_at");
+      .select("user_id,last_read_at,last_delivered_at,last_seen_at");
     if (!error && data) setReceipts(data as Receipt[]);
   }, []);
 
@@ -399,6 +454,24 @@ export default function Home() {
             if (!incoming?.id || !alive) return;
             if (incoming.sender_id === userId) return;
             setMessages((previous) => mergeMessages(previous, [incoming]));
+
+            // Desktop notification when the tab is hidden
+            if (
+              document.visibilityState === "hidden" &&
+              typeof Notification !== "undefined" &&
+              Notification.permission === "granted"
+            ) {
+              try {
+                const n = new Notification(PEOPLE.them.name, {
+                  body: incoming.content.slice(0, 120),
+                  tag: incoming.id,
+                });
+                n.onclick = () => {
+                  window.focus();
+                  n.close();
+                };
+              } catch {}
+            }
           },
         )
         .on(
@@ -491,6 +564,14 @@ export default function Home() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [supabase, userId, loadMessages, loadReceipts]);
 
+  /* ---------- page visibility (for unread title) ---------- */
+  useEffect(() => {
+    const update = () => setPageHidden(document.visibilityState === "hidden");
+    update();
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, []);
+
   /* ---------- receipts ---------- */
   const pingReceipt = useCallback(
     async (kind: "delivered" | "read") => {
@@ -526,6 +607,50 @@ export default function Home() {
     if (stickToBottom.current && document.visibilityState === "visible")
       void pingReceipt("read");
   }, [messages, userId, pingReceipt]);
+
+  /* ---------- presence heartbeat ---------- */
+  useEffect(() => {
+    if (!supabase || !userId) return;
+
+    const ping = () => {
+      if (document.visibilityState !== "visible") return;
+      const patch: { user_id: string; last_seen_at: string } = {
+        user_id: userId,
+        last_seen_at: new Date().toISOString(),
+      };
+      void supabase
+        .from("message_reads")
+        .upsert(patch, { onConflict: "user_id" });
+    };
+
+    ping();
+    const id = setInterval(ping, 30_000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") ping();
+    };
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [supabase, userId]);
+
+  /* ---------- notification permission (once, post-signin) ---------- */
+  useEffect(() => {
+    if (!user) return;
+    if (typeof Notification === "undefined") return;
+    if (askedNotifPerm.current) return;
+    if (Notification.permission !== "default") return;
+    askedNotifPerm.current = true;
+
+    const t = setTimeout(() => {
+      try {
+        Notification.requestPermission().catch(() => {});
+      } catch {}
+    }, 3000);
+    return () => clearTimeout(t);
+  }, [user]);
 
   /* ---------- scrolling ---------- */
   useEffect(() => {
@@ -595,6 +720,31 @@ export default function Home() {
     () => receipts.find((r) => r.user_id !== user?.id) ?? null,
     [receipts, user],
   );
+
+  const myReceipt = useMemo(
+    () => receipts.find((r) => r.user_id === user?.id) ?? null,
+    [receipts, user],
+  );
+
+  const unreadCount = useMemo(() => {
+    if (!user || !pageHidden) return 0;
+    const myLastRead = myReceipt?.last_read_at
+      ? timeOf(myReceipt.last_read_at)
+      : 0;
+    return messages.filter(
+      (m) =>
+        m.sender_id !== user.id &&
+        !m.deleted_at &&
+        !(m as Outgoing).status &&
+        timeOf(m.created_at) > myLastRead,
+    ).length;
+  }, [messages, user, myReceipt, pageHidden]);
+
+  /* ---------- unread tab title ---------- */
+  useEffect(() => {
+    const base = "close 💌 just us";
+    document.title = unreadCount > 0 ? `(${unreadCount}) ${base}` : base;
+  }, [unreadCount]);
 
   function receiptStateFor(message: Outgoing) {
     if (message.status === "sending") return "sending" as const;
@@ -1042,10 +1192,10 @@ export default function Home() {
             <Avatar person={PEOPLE.them} ring />
             <div className="person-copy">
               <h1>{APP.chatTitle}</h1>
-              <div className="presence" role="status">
-                <span className={`presence-dot ${online ? "is-online" : ""}`} />
-                {online ? "online" : "connecting…"}
-              </div>
+              <PresenceLabel
+                connected={online}
+                lastSeenAt={otherReceipt?.last_seen_at ?? null}
+              />
             </div>
           </div>
           <div className="header-actions">

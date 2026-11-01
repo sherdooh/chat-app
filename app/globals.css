@@ -4,25 +4,22 @@
   Fonts from layout.tsx (display: Bricolage Grotesque, body: DM Sans).
 */
 :root {
-  --bg: #fbf3e8; /* page behind the chat */
-  --paper: #fffdf9; /* cards, header, their bubbles */
-  --soft: #fdf6ec; /* chat wallpaper */
-  --ink: #2b2622;
-  --muted: #857a70;
-  --line: #efe4d5;
   --bg: #fbf3e8;
   --paper: #fffdf9;
   --soft: #fdf6ec;
   --ink: #2b2622;
-  --muted: #--green: #1f7a5c; /* primary accent */
+  --muted: #857a70;
+  --line: #efe4d5;
+
+  --green: #1f7a5c;
   --green-deep: #17604a;
   --green-soft: #e1f3e8;
-  --mine: #d6f0dd; /* my bubbles */
+  --mine: #d6f0dd;
   --mine-ink: #1e3a2b;
 
   --peach: #ffb995;
   --peach-soft: #ffeadd;
-  --coral: #ef7b5b; /* brand period only */
+  --coral: #ef7b5b;
 
   --danger: #b4432f;
   --danger-soft: #fff0ea;
@@ -470,7 +467,9 @@ button {
   background: #34a874;
   box-shadow: 0 0 0 3px var(--green-soft);
 }
-
+.presence-dot.is-offline {
+  background: #c8bdb2;
+}
 .header-actions {
   display: flex;
   align-items: center;
@@ -644,14 +643,19 @@ button {
   align-items: flex-end;
   gap: 8px;
   margin-top: 14px;
-  animation: msg-in 0.28s cubic-bezier(0.2, 0.8, 0.25, 1) both;
+  animation: msg-in 0.22s cubic-bezier(0.2, 0.8, 0.25, 1) both;
 }
 @keyframes msg-in {
   from {
     opacity: 0;
-    transform: translateY(7px);
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
   }
 }
+
 .message-row.joined {
   margin-top: 3px;
 }
@@ -702,6 +706,17 @@ button {
 }
 .bubble-theirs.ends-group {
   border-bottom-left-radius: 6px;
+}
+.bubble.bubble-emoji-only {
+  padding: 4px 8px;
+  font-size: 42px;
+  line-height: 1.1;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+.bubble.bubble-emoji-only .meta {
+  font-size: 11.5px;
 }
 
 .text {
