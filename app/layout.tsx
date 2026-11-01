@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Bricolage_Grotesque, DM_Sans } from "next/font/google";
+import { DM_Sans, Fraunces } from "next/font/google";
 import "./globals.css";
 
 // Self-hosted by Next at build time: no render-blocking @import, no flash of unstyled text.
@@ -8,7 +8,8 @@ const body = DM_Sans({
   variable: "--font-body",
   display: "swap",
 });
-const display = Bricolage_Grotesque({
+// A soft, friendly serif for names, headings and the logo: the "close." personality.
+const display = Fraunces({
   subsets: ["latin"],
   variable: "--font-display",
   display: "swap",
@@ -18,7 +19,7 @@ export const metadata: Metadata = {
   title: "close 💌 just us",
   description: "Our little corner of the internet. Just the two of us.",
   applicationName: "close",
-  robots: { index: false, follow: false },
+  robots: { index: false, follow: false }, // it's private, keep it out of search engines
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
@@ -30,8 +31,8 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  interactiveWidget: "resizes-content",
-  themeColor: "#fbf3e8", // was "#fff6ec" — matches --bg
+  interactiveWidget: "resizes-content", // keeps the message box above the mobile keyboard
+  themeColor: "#fbf3ea",
 };
 
 export default function RootLayout({
