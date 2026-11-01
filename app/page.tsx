@@ -34,7 +34,7 @@ import type { SupabaseClient, User } from "@supabase/supabase-js";
 
 const APP = {
   name: "close",
-  chatTitle: "hey babe 💕",
+  chatTitle: "oh, HI",
   creator: "Shaddie",
 };
 
