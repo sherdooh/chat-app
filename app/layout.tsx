@@ -2,16 +2,15 @@ import type { Metadata, Viewport } from "next";
 import { DM_Sans, Fraunces } from "next/font/google";
 import "./globals.css";
 
-// Self-hosted by Next at build time: no render-blocking @import, no flash of unstyled text.
 const body = DM_Sans({
   subsets: ["latin"],
   variable: "--font-body",
   display: "swap",
 });
-// A soft, friendly serif for names, headings and the logo: the "close." personality.
+// --font-serif (was --font-display): avoids a self-reference in @theme
 const display = Fraunces({
   subsets: ["latin"],
-  variable: "--font-display",
+  variable: "--font-serif",
   display: "swap",
 });
 
@@ -19,7 +18,7 @@ export const metadata: Metadata = {
   title: "close 💌 just us",
   description: "Our little corner of the internet. Just the two of us.",
   applicationName: "close",
-  robots: { index: false, follow: false }, // it's private, keep it out of search engines
+  robots: { index: false, follow: false },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
@@ -31,8 +30,8 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  interactiveWidget: "resizes-content", // keeps the message box above the mobile keyboard
-  themeColor: "#fbf3ea",
+  interactiveWidget: "resizes-content",
+  themeColor: "#f8fafc",
 };
 
 export default function RootLayout({
